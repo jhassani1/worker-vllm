@@ -61,6 +61,27 @@ DEFAULT_ARGS = {
 }
 
 
+# Some AsyncEngineArgs config fields are typed as nested dataclasses in vLLM.
+# Their annotations are not always concrete enough for our generic env parsing
+# to infer "this should be JSON", so accept JSON object/array strings for the
+# known config-style fields and pass the parsed dict through to vLLM.
+JSON_COMPAT_FIELDS = {
+    "additional_config",
+    "attention_config",
+    "compilation_config",
+    "eplb_config",
+    "hf_overrides",
+    "kernel_config",
+    "limit_mm_per_prompt",
+    "model_loader_extra_config",
+    "observability_config",
+    "pooler_config",
+    "profiler_config",
+    "speculative_config",
+    "structured_outputs_config",
+}
+
+
 def _resolve_field_type(field_type: type) -> type:
     """Resolve Optional/Union to the concrete type for conversion."""
     origin = get_origin(field_type)
@@ -81,6 +102,21 @@ def _convert_env_value_to_field_type(value: str, field_name: str, field_type: ty
         if type(None) in (args or ()):
             return None
         raise ValueError("empty value not allowed for non-optional field")
+    union_args = get_args(field_type) if hasattr(field_type, "__args__") else ()
+    # Some vLLM fields (notably hf_token) are annotated as bool|str|None and we
+    # want non-boolean-looking env values to stay strings instead of collapsing
+    # to False.
+    if isinstance(val, str) and str in union_args and bool in union_args:
+        if str(val).lower() not in ("true", "false", "1", "0", "yes", "no", "on", "off"):
+            return str(val)
+    parsed_json = None
+    parsed_json_ok = False
+    if isinstance(val, str) and val[:1] in ("{", "["):
+        try:
+            parsed_json = json.loads(val)
+            parsed_json_ok = True
+        except json.JSONDecodeError:
+            parsed_json = None
     effective_type = _resolve_field_type(field_type)
     # bool
     if effective_type is bool:
@@ -93,14 +129,20 @@ def _convert_env_value_to_field_type(value: str, field_name: str, field_type: ty
         return float(val)
     # str
     if effective_type is str:
+        if field_name in JSON_COMPAT_FIELDS and parsed_json_ok:
+            return parsed_json
         return str(val)
     # dict, list, or complex (try JSON)
     origin = get_origin(effective_type)
     if effective_type in (dict, list) or origin in (dict, list):
+        if parsed_json_ok:
+            return parsed_json
         try:
             return json.loads(val)
         except json.JSONDecodeError:
             return val
+    if field_name in JSON_COMPAT_FIELDS and parsed_json_ok:
+        return parsed_json
     # tuple (e.g. long_lora_scaling_factors) — comma-separated or JSON array
     if effective_type is tuple or origin is tuple:
         args = get_args(field_type) if hasattr(field_type, "__args__") else ()
